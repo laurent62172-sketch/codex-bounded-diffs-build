@@ -1,0 +1,7 @@
+Experimental validation build from public OpenAI Codex source.
+Upstream commit: 4ebc485ca321243727539187169425fcf972f2c4
+Upstream tag: rust-v0.163.0-alpha.10.2
+Changes: globally bound untracked-file Git diff operations to eight concurrent operations, preserve ordering and cancellation cleanup; add regression tests. A separate lockfile patch aligns local workspace package versions without changing external dependencies.
+The workflow downloads only public upstream source. It requires no OpenAI account, credentials, personal repositories or user sessions.
+A successful workflow means Git utility tests, full CLI compilation, version verification and app-server --help succeeded. It does not mean mobile end-to-end behavior has been validated. No deployment or installation is performed.
+This is an unofficial test build, not an official OpenAI release.
