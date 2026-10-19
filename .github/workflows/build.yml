@@ -1,0 +1,47 @@
+name: Validate bounded Git diffs on Windows
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: codex-bounded-windows
+  cancel-in-progress: false
+jobs:
+  validate-build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TARGET_DIR: D:\codex-target
+      CARGO_HOME: D:\codex-cargo
+      CODEX_HOME: D:\codex-fixture-home
+      RUST_BACKTRACE: '1'
+    steps:
+      - name: Checkout public build recipe only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Fetch public source, test, build and verify
+        shell: pwsh
+        run: ./build.ps1
+      - name: Upload tested binary and results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: codex-windows-bounded-diffs-tested
+          path: D:\codex-results\
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: codex-build-diagnostics
+          path: |
+            D:\codex-results\*.txt
+            D:\codex-results\LICENSE
+            D:\codex-results\NOTICE
+          if-no-files-found: ignore
+          retention-days: 7
