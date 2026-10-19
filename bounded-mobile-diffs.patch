@@ -1,0 +1,155 @@
+diff --git a/codex-rs/git-utils/Cargo.toml b/codex-rs/git-utils/Cargo.toml
+index c9409d4..cacddbc 100644
+--- a/codex-rs/git-utils/Cargo.toml
++++ b/codex-rs/git-utils/Cargo.toml
+@@ -26,7 +26,7 @@ serde = { workspace = true, features = ["derive"] }
+ similar = { workspace = true }
+ tempfile = { workspace = true }
+ thiserror = { workspace = true }
+-tokio = { workspace = true, features = ["macros", "process", "rt", "time"] }
++tokio = { workspace = true, features = ["macros", "process", "rt", "sync", "time"] }
+ ts-rs = { workspace = true, features = [
+     "uuid-impl",
+     "serde-json-impl",
+diff --git a/codex-rs/git-utils/src/info.rs b/codex-rs/git-utils/src/info.rs
+index aec8a01..47b83cb 100644
+--- a/codex-rs/git-utils/src/info.rs
++++ b/codex-rs/git-utils/src/info.rs
+@@ -4,6 +4,9 @@ use std::path::Path;
+ use std::path::PathBuf;
+ 
+ use futures::future::join_all;
++use futures::StreamExt;
++use futures::stream;
++use tokio::sync::Semaphore;
+ use schemars::JsonSchema;
+ use serde::Deserialize;
+ use serde::Serialize;
+@@ -38,6 +41,8 @@ pub fn get_git_repo_root(base_dir: &Path) -> Option<PathBuf> {
+ 
+ /// Timeout for git commands to prevent freezing on large repositories
+ const GIT_COMMAND_TIMEOUT: TokioDuration = TokioDuration::from_secs(5);
++const UNTRACKED_DIFF_CONCURRENCY: usize = 8;
++static UNTRACKED_DIFF_SLOTS: Semaphore = Semaphore::const_new(UNTRACKED_DIFF_CONCURRENCY);
+ const DISABLED_HOOKS_PATH: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+ 
+ #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
+@@ -756,8 +761,12 @@ async fn diff_against_sha(cwd: &Path, sha: &GitSha) -> Option<String> {
+                 ];
+                 run_git_command_with_timeout_from(git, &args_vec, cwd, fsmonitor).await
+             });
+-            let results = join_all(futures_iter).await;
+-            for extra in results.into_iter().flatten() {
++            let results = bounded_untracked_diffs(futures_iter);
++            futures::pin_mut!(results);
++            while let Some(extra) = results.next().await {
++                let Some(extra) = extra else {
++                    continue;
++                };
+                 if extra.status.code().is_some_and(|c| c == 0 || c == 1)
+                     && let Ok(s) = String::from_utf8(extra.stdout)
+                 {
+@@ -770,6 +779,26 @@ async fn diff_against_sha(cwd: &Path, sha: &GitSha) -> Option<String> {
+     Some(diff)
+ }
+ 
++// Limit both one request and overlapping requests before polling spawn futures.
++// Buffered preserves listing order; RAII releases the slot on cancellation.
++fn bounded_untracked_diffs<I, F>(diffs: I) -> impl futures::Stream<Item = F::Output> + Send
++where
++    I: IntoIterator<Item = F>,
++    I::IntoIter: Send,
++    F: std::future::Future + Send,
++    F::Output: Send,
++{
++    stream::iter(diffs)
++        .map(|diff| async move {
++            let _slot = UNTRACKED_DIFF_SLOTS
++                .acquire()
++                .await
++                .expect("untracked diff semaphore is never closed");
++            diff.await
++        })
++        .buffered(UNTRACKED_DIFF_CONCURRENCY)
++}
++
+ fn find_ancestor_git_entry(base_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+     let mut dir = base_dir.to_path_buf();
+ 
+@@ -1196,4 +1225,76 @@ mod tests {
+             ]
+         );
+     }
++
++    #[tokio::test]
++    async fn untracked_diff_requests_share_limit_and_preserve_order() {
++        use std::sync::Arc;
++        use std::sync::atomic::{AtomicUsize, Ordering};
++        let active = Arc::new(AtomicUsize::new(0));
++        let peak = Arc::new(AtomicUsize::new(0));
++        let mut tasks = Vec::new();
++        for batch in 0..2 {
++            let active = active.clone();
++            let peak = peak.clone();
++            // Spawning also checks that the stream and its output remain Send.
++            tasks.push(tokio::spawn(async move {
++                let diffs = (0..16).map(|index| {
++                    let active = active.clone();
++                    let peak = peak.clone();
++                    async move {
++                        let count = active.fetch_add(1, Ordering::SeqCst) + 1;
++                        peak.fetch_max(count, Ordering::SeqCst);
++                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
++                        active.fetch_sub(1, Ordering::SeqCst);
++                        batch * 16 + index
++                    }
++                });
++                bounded_untracked_diffs(diffs).collect::<Vec<_>>().await
++            }));
++        }
++        for (batch, task) in tasks.into_iter().enumerate() {
++            let actual = task.await.expect("batch completed");
++            let expected: Vec<_> = (batch * 16..batch * 16 + 16).collect();
++            assert_eq!(actual, expected);
++        }
++        assert_eq!(active.load(Ordering::SeqCst), 0);
++        assert!(peak.load(Ordering::SeqCst) > 0);
++        assert!(peak.load(Ordering::SeqCst) <= UNTRACKED_DIFF_CONCURRENCY);
++    }
++
++    #[tokio::test]
++    async fn untracked_diff_cancellation_returns_all_slots() {
++        assert_eq!(UNTRACKED_DIFF_SLOTS.available_permits(), 8);
++        let mut work = Box::pin(bounded_untracked_diffs((0..16).map(|_| std::future::pending::<()>())));
++        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), work.next()).await.is_err());
++        assert_eq!(UNTRACKED_DIFF_SLOTS.available_permits(), 0);
++        drop(work);
++        assert_eq!(UNTRACKED_DIFF_SLOTS.available_permits(), 8);
++    }
++    #[test]
++    fn remote_diff_future_still_implements_send() {
++        fn assert_send<T: Send>(_: T) {}
++        assert_send(git_diff_to_remote(Path::new(".")));
++    }
++    #[tokio::test]
++    async fn bounded_diff_keeps_all_fixture_files() {
++        let fixture = tempfile::tempdir().expect("fixture");
++        let cwd = fixture.path();
++        let git = |args: &[&str]| {
++            let output = std::process::Command::new("git")
++                .args(["-c", "core.hooksPath=NUL", "-c", "commit.gpgsign=false"])
++                .args(args).current_dir(cwd).output().expect("git fixture");
++            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
++            String::from_utf8(output.stdout).expect("utf8")
++        };
++        git(&["init", "-q"]);
++        git(&["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "fixture"]);
++        let sha = GitSha(git(&["rev-parse", "HEAD"]).trim().to_string());
++        for i in 0..4 {
++            std::fs::write(cwd.join(format!("file-{i}.txt")), format!("fixture-content-{i}\n")).expect("fixture file");
++        }
++        let diff = diff_against_sha(cwd, &sha).await.expect("complete diff");
++        for i in 0..4 {assert!(diff.contains(&format!("+fixture-content-{i}")));}
++        assert_eq!(diff.matches("diff --git ").count(), 4);
++    }
+ }
